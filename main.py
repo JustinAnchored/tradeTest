@@ -22,6 +22,10 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e
 FULCRUM_HOST = os.getenv("FULCRUM_HOST", "rootsfulfillment.shoppingcartfulfillment.com")
 FULCRUM_AUTH = os.getenv("FULCRUM_AUTH", "Basic am1vbm5pZzpBbmNob3JlZDEyMzgh")  # e.g. "Bearer xxx" or "xxxxx" as required
 
+# Host + endpoint
+FULCRUM_BASE = os.getenv("FULCRUM_BASE", "https://rootsfulfillment.shoppingcartfulfillment.com")
+FULCRUM_PATH = os.getenv("FULCRUM_PATH", "/fulcrum/dstContainer.php")
+
 
 # IMPORTANT: This is what replaces your old Authorization header.
 # Use your browser cookie string from curl -b '...'
