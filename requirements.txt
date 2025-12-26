@@ -2,4 +2,4 @@ fastapi
 uvicorn
 httpx
 jinja2
-supabase-py
+supabase
