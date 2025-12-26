@@ -1,15 +1,13 @@
 import asyncio
 import os
-import math
-from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+import re
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from jinja2 import Environment, DictLoader, select_autoescape
-
-# Supabase (supabase-py)
 from supabase import create_client
 
 
@@ -24,21 +22,30 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e
 FULCRUM_HOST = os.getenv("FULCRUM_HOST", "rootsfulfillment.shoppingcartfulfillment.com")
 FULCRUM_AUTH = os.getenv("FULCRUM_AUTH", "Basic am1vbm5pZzpBbmNob3JlZDEyMzgh")  # e.g. "Bearer xxx" or "xxxxx" as required
 
-# Import behavior
-START_ON_STARTUP = os.getenv("START_ON_STARTUP", "true").lower() == "true"
 
-# Throttling / reliability
+# IMPORTANT: This is what replaces your old Authorization header.
+# Use your browser cookie string from curl -b '...'
+# Example: "ace.settings=...; dstToken=...; dstCloudComputer=..."
+FULCRUM_COOKIE = os.getenv("FULCRUM_COOKIE", "ace.settings=%7B%22navbar-fixed%22%3A1%2C%22sidebar-fixed%22%3A1%2C%22sidebar-collapsed%22%3A-1%7D; dstIntegratedLabelType=1; dstPrintOrderChecked=1; dstCloudComputer=641378; dstLabelPrinterFormat_74392833=PDF; dstLabelPrinterFormat_74451316=ZPL; ajs_anonymous_id=%225c037d72-7ca4-48f8-98ac-01245b4f9414%22; dstLabelPrinter=74392833; dstLabelPrinterFormat=PDF; dstIntegratedLabelPrinter=74392833; dstPackingListPrinter=74392833; dstPickTicketPrinter=74392833; dstToken=8a22ce4a68e3a9369132cfd89fa4a3ff")
+
+# Owners to iterate (dstOwnerList)
+OWNER_IDS = ["33423","27","98580","31","566813","59921","641632","524862","1004425","295644","309210","581507","609057","150705","296540","296517","296546","288234","488296","513406","447199","214228","437199","106234","279259","28","296426","132850","638486","518270","181418","223858","51","32","29","260886","489011","46495","33524","10","181324","56","265694","258737","363440","617057","84524","460759","91040","513422","451243","9","55","517974","225472","260976","623746","66652","50471","167781"]
+
+
+# Pagination
+PAGE_SIZE = int(os.getenv("PAGE_SIZE", "100"))  # length=100
 SLEEP_BETWEEN_PAGES_SEC = float(os.getenv("SLEEP_BETWEEN_PAGES_SEC", "0.15"))
+
+# Reliability
 HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "30"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "6"))
 RETRY_BASE_SLEEP_SEC = float(os.getenv("RETRY_BASE_SLEEP_SEC", "1.0"))
 
-# Batch sizes
-UPSERT_ORDERS_BATCH_SIZE = int(os.getenv("UPSERT_ORDERS_BATCH_SIZE", "250"))
+# Start behavior
+START_ON_STARTUP = os.getenv("START_ON_STARTUP", "false").lower() == "true"
 
-# Table names (match SQL above)
-TBL_ORDERS = "wms_orders"
-TBL_ROLLUP = "wms_customer_rollup"
+# Supabase tables
+TBL_CONTACTS = "wms_contacts"
 TBL_STATE = "wms_job_state"
 
 # =============================================================================
@@ -49,7 +56,7 @@ STATUS_TEMPLATE = """
 <html>
   <head>
     <meta charset="utf-8"/>
-    <title>WMS Import Status</title>
+    <title>WMS Contacts Import Status</title>
     <style>
       body { font-family: Arial, sans-serif; margin: 24px; }
       .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
@@ -67,7 +74,7 @@ STATUS_TEMPLATE = """
     </style>
   </head>
   <body>
-    <h2>WMS Import Status</h2>
+    <h2>WMS Contacts Import Status</h2>
 
     <div class="card">
       <div class="row">
@@ -99,13 +106,14 @@ STATUS_TEMPLATE = """
       </div>
 
       <p class="muted" style="margin-top:10px;">
-        Cursor: <code>{{ state.cursor_date or 'null' }}</code> page <code>{{ state.cursor_page }}</code>
-        &nbsp;|&nbsp; Range: <code>{{ state.run_start_date or 'null' }}</code> → <code>{{ state.run_end_date or 'null' }}</code>
+        Owner cursor: <code>{{ state.cursor_owner or 'null' }}</code>
+        Start offset: <code>{{ state.cursor_start or 0 }}</code>
+        Page size: <code>{{ page_size }}</code>
       </p>
 
       <p class="muted">
         Processed: <span class="mono">{{ state.pages_processed }}</span> pages,
-        <span class="mono">{{ state.orders_processed }}</span> orders
+        <span class="mono">{{ state.orders_processed }}</span> rows
       </p>
 
       <p class="muted">Last message: <span class="mono">{{ state.last_message or '' }}</span></p>
@@ -118,10 +126,6 @@ STATUS_TEMPLATE = """
       <h3>Controls</h3>
 
       <form method="get" action="/start">
-        <label>start_date (YYYY-MM-DD):</label>
-        <input name="start_date" value="{{ default_start }}">
-        <label>end_date (YYYY-MM-DD):</label>
-        <input name="end_date" value="{{ default_end }}">
         <button type="submit">Start / Resume</button>
       </form>
 
@@ -134,19 +138,15 @@ STATUS_TEMPLATE = """
       </form>
 
       <form method="get" action="/reset">
-        <button type="submit">Reset cursor to start_date</button>
+        <button type="submit">Reset cursor (owner 1, start=0)</button>
       </form>
     </div>
 
     <div class="card">
-      <h3>Tips</h3>
-      <ul>
-        <li>If heartbeat stops updating while status is <code>running</code>, the importer is stuck or dead.</li>
-        <li>Use <code>/start</code> to resume; it reads checkpoint from <code>wms_job_state</code>.</li>
-        <li>For DigitalOcean, run a single uvicorn worker (avoid multiple background importers).</li>
-      </ul>
+      <h3>Owner list</h3>
+      <p class="mono">{{ owners }}</p>
+      <p class="muted">Importer runs owner-by-owner, paging using start/length until it gets fewer than length rows.</p>
     </div>
-
   </body>
 </html>
 """.strip()
@@ -156,7 +156,6 @@ jinja_env = Environment(
     loader=DictLoader({"status.html": STATUS_TEMPLATE}),
     autoescape=select_autoescape(["html", "xml"]),
 )
-
 
 app = FastAPI()
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -169,311 +168,295 @@ _worker_lock = asyncio.Lock()
 # Helpers
 # =============================================================================
 
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-
-def _parse_ymd(s: str) -> date:
-    return datetime.strptime(s, "%Y-%m-%d").date()
-
-
-def _fmt_fulcrum_date(d: date) -> str:
-    # API expects MM/DD/YYYY
-    return d.strftime("%m/%d/%Y")
-
-
-def _safe_lower_email(email: Optional[str]) -> Optional[str]:
-    if not email:
+def _safe_text(x: Any) -> Optional[str]:
+    if x is None:
         return None
-    return email.strip().lower() or None
+    s = str(x).strip()
+    return s if s else None
 
+EMAIL_RE = re.compile(r"mailto:([^\"'>\s]+)", re.IGNORECASE)
+ID_RE = re.compile(r"[?&]id=(\d+)", re.IGNORECASE)
 
-def _make_customer_uid(owner: str, email: Optional[str]) -> Optional[str]:
-    email_l = _safe_lower_email(email)
-    if not email_l:
+def parse_email(html: str) -> Optional[str]:
+    if not html:
         return None
-    return f"{owner.strip()}|{email_l}"
+    m = EMAIL_RE.search(html)
+    if not m:
+        return None
+    return m.group(1).strip().lower()
 
-
-def _make_order_uid(owner: str, sales_order_id: str) -> str:
-    return f"{owner.strip()}|{str(sales_order_id).strip()}"
-
-
-def _parse_last_updated_on(s: Optional[str]) -> Tuple[Optional[datetime], Optional[str]]:
-    """
-    Fulcrum sample: "2025-12-24 03:22:50"
-    Timezone is not specified. We store the raw string too.
-    We interpret as UTC to keep timestamptz consistent.
-    """
-    if not s:
-        return None, None
-    raw = s
+def parse_company_id(html: str) -> Optional[int]:
+    if not html:
+        return None
+    m = ID_RE.search(html)
+    if not m:
+        return None
     try:
-        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        return dt, raw
+        return int(m.group(1))
     except Exception:
-        return None, raw
+        return None
 
 
-def _chunked(lst: List[Dict[str, Any]], n: int) -> List[List[Dict[str, Any]]]:
-    return [lst[i : i + n] for i in range(0, len(lst), n)]
+async def sb_get_state() -> Dict[str, Any]:
+    resp = supabase.table(TBL_STATE).select("*").eq("id", 1).execute()
+    if resp.data and len(resp.data) > 0:
+        return resp.data[0]
 
-
-async def _supabase_get_state() -> Dict[str, Any]:
-    try:
-        resp = supabase.table(TBL_STATE).select("*").eq("id", 1).execute()
-        if resp.data and len(resp.data) > 0:
-            return resp.data[0]
-    except Exception:
-        pass
-
-    # Ensure it exists
-    supabase.table(TBL_STATE).upsert({"id": 1, "status": "idle"}).execute()
+    # Ensure row exists
+    supabase.table(TBL_STATE).upsert({"id": 1, "status": "idle", "cursor_start": 0}).execute()
     resp2 = supabase.table(TBL_STATE).select("*").eq("id", 1).execute()
     return resp2.data[0]
 
 
-async def _supabase_update_state(patch: Dict[str, Any]) -> None:
+async def sb_update_state(patch: Dict[str, Any]) -> None:
     patch = dict(patch)
-    patch["updated_at"] = _now_utc().isoformat()
+    patch["updated_at"] = now_utc_iso()
     try:
         supabase.table(TBL_STATE).update(patch).eq("id", 1).execute()
     except Exception as e:
-        # Last resort: don't crash the worker due to status update
         print("Failed to update state:", e)
 
 
-async def _http_get_salesorders(day: date, page: int) -> Dict[str, Any]:
+def datatables_base_params() -> Dict[str, str]:
     """
-    Fetch one page for a single day window: from_date = day, to_date = day + 1
+    Minimal-ish DataTables params. Your server may want many of these;
+    this set is typically enough for dstContactSearch.
     """
-    from_date = _fmt_fulcrum_date(day)
-    to_date = _fmt_fulcrum_date(day + timedelta(days=1))
+    params = {
+        "dstObjectType": "dstContactSearch",
+        "cmd": "Search",
+        "dstJson": "1",
+        "dstSearchCriteria": "",
+        "dstSearchSel": "1",
+        "dstContactTypeList": "2",
+        "dstActive": "1",
+        "draw": "1",
+        "dstSearch": "",
+        "dstSearchSel": "1",
+        "dstSearchCriteria": "",
+        "search[value]": "",
+        "search[regex]": "false",
+        "order[0][column]": "2",
+        "order[0][dir]": "asc",
+    }
 
-    url = f"https://{FULCRUM_HOST}/api.v2/salesorder/"
-    headers = {"Content-Type": "application/json", "Authorization": FULCRUM_AUTH}
-    params = {"from_date": from_date, "to_date": to_date, "page": str(page)}
+    # Columns 0..11 (like your curl)
+    for i in range(12):
+        params[f"columns[{i}][data]"] = str(i)
+        params[f"columns[{i}][name]"] = ""
+        params[f"columns[{i}][searchable]"] = "true"
+        params[f"columns[{i}][orderable]"] = "true" if i != 0 else "false"
+        params[f"columns[{i}][search][value]"] = ""
+        params[f"columns[{i}][search][regex]"] = "false"
+
+    return params
+
+
+async def http_fetch_contacts(owner_id: str, start: int, length: int) -> Dict[str, Any]:
+    url = f"{FULCRUM_BASE}{FULCRUM_PATH}"
+
+    params = datatables_base_params()
+    params["dstOwnerList"] = owner_id
+    params["start"] = str(start)
+    params["length"] = str(length)
+
+    headers = {
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"{FULCRUM_BASE}/fulcrum/dstContainer.php?dstObjectType=dstContactSearch&dstContactTypeList=2",
+        "User-Agent": "Mozilla/5.0",
+        "Connection": "keep-alive",
+        "Cookie": FULCRUM_COOKIE,
+    }
 
     last_exc: Optional[Exception] = None
-
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             timeout = httpx.Timeout(HTTP_TIMEOUT_SEC)
             async with httpx.AsyncClient(timeout=timeout) as client:
-                r = await client.get(url, headers=headers, params=params)
+                r = await client.get(url, params=params, headers=headers)
             if r.status_code == 429:
-                # Rate limited: backoff
-                sleep_s = RETRY_BASE_SLEEP_SEC * (2 ** (attempt - 1))
-                await asyncio.sleep(min(sleep_s, 60))
+                await asyncio.sleep(min(RETRY_BASE_SLEEP_SEC * (2 ** (attempt - 1)), 60))
                 continue
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last_exc = e
-            sleep_s = RETRY_BASE_SLEEP_SEC * (2 ** (attempt - 1))
-            await asyncio.sleep(min(sleep_s, 60))
+            await asyncio.sleep(min(RETRY_BASE_SLEEP_SEC * (2 ** (attempt - 1)), 60))
 
-    raise RuntimeError(f"Failed fetching {url} day={day} page={page}: {last_exc}")
+    raise RuntimeError(f"Fetch failed owner={owner_id} start={start} length={length}: {last_exc}")
 
 
-def _order_to_row(o: Dict[str, Any]) -> Dict[str, Any]:
-    owner = (o.get("owner") or "").strip()
-    sales_order_id = str(o.get("sales_order_id") or "").strip()
-    order_uid = _make_order_uid(owner, sales_order_id)
+def row_to_contact(owner_id: str, row: List[Any]) -> Dict[str, Any]:
+    """
+    Data is like: payload["data"] = [ [col0, col1, ... col11], ... ]
+    We'll extract:
+      - company_id from col0 (Select link)
+      - company_name from col1
+      - contact_type from col2
+      - contact_name from col4
+      - email from col10 (mailto)
+    Store the full row array into raw_columns.
+    """
+    col0 = _safe_text(row[0]) if len(row) > 0 else None
+    col1 = _safe_text(row[1]) if len(row) > 1 else None
+    col2 = _safe_text(row[2]) if len(row) > 2 else None
+    col4 = _safe_text(row[4]) if len(row) > 4 else None
+    col10 = _safe_text(row[10]) if len(row) > 10 else None
 
-    email = o.get("email_address")
-    customer_uid = _make_customer_uid(owner, email)
+    company_id = parse_company_id(col0 or "")
+    email = parse_email(col10 or "")
 
-    last_updated_on_dt, last_updated_on_raw = _parse_last_updated_on(o.get("last_updated_on"))
+    # Primary key strategy:
+    # Prefer owner|company_id (stable)
+    # Fallback to owner|email if company_id missing
+    # Fallback to owner|hash-like timestamp if both missing (rare)
+    if company_id is not None:
+        contact_uid = f"{owner_id}|{company_id}"
+    elif email:
+        contact_uid = f"{owner_id}|{email}"
+    else:
+        contact_uid = f"{owner_id}|unknown|{int(datetime.now().timestamp()*1000)}"
 
-    row = {
-        "order_uid": order_uid,
-        "owner": owner,
-        "sales_order_id": int(sales_order_id) if sales_order_id.isdigit() else None,
-        "customer_uid": customer_uid,
-        "email": _safe_lower_email(email),
-        "customer_name": o.get("customer_name"),
-        "phone_number": o.get("phone_number"),
-
-        "order_number": o.get("order_number"),
-        "merchant_order_number": o.get("merchant_order_number"),
-        "warehouse": o.get("warehouse"),
-
-        "amount_due": o.get("amount_due"),
-        "tax": o.get("tax"),
-        "shipping": o.get("shipping"),
-
-        "status": o.get("status"),
-        "tags": o.get("tags"),
-
-        "shipping_provider": o.get("shipping_provider"),
-        "shipping_provider_service": o.get("shipping_provider_service"),
-
-        "last_updated_on": last_updated_on_dt.isoformat() if last_updated_on_dt else None,
-        "last_updated_on_raw": last_updated_on_raw,
-
-        "shipping_address_json": o.get("shipping_address"),
-        "billing_address_json": o.get("billing_address"),
-
-        # "raw_json" minimized per your request: just line items
-        "lineitems_json": o.get("order_details") or [],
-
-        "ingested_at": _now_utc().isoformat(),
+    return {
+        "contact_uid": contact_uid,
+        "owner_id": owner_id,
+        "company_id": company_id,
+        "company_name": col1,
+        "contact_type": col2,
+        "contact_name": col4,
+        "email": email,
+        "raw_columns": row,
+        "ingested_at": now_utc_iso(),
     }
 
-    return row
 
-
-async def _upsert_orders(rows: List[Dict[str, Any]]) -> None:
+async def upsert_contacts(rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
-
-    for batch in _chunked(rows, UPSERT_ORDERS_BATCH_SIZE):
-        # Upsert by primary key order_uid (idempotent)
-        supabase.table(TBL_ORDERS).upsert(batch, on_conflict="order_uid").execute()
+    supabase.table(TBL_CONTACTS).upsert(rows, on_conflict="contact_uid").execute()
 
 
-async def _refresh_rollups_for_customer_uids(customer_uids: List[str]) -> None:
-    if not customer_uids:
-        return
-
-    # De-dupe and keep reasonable size
-    uids = sorted(set([u for u in customer_uids if u]))
-
-    # Compute rollups in Postgres (idempotent, avoids double counting)
-    resp = supabase.rpc("compute_customer_rollups", {"uids": uids}).execute()
-    rollup_rows = resp.data or []
-
-    # Upsert rollups
-    # Keep updated_at current
-    now_iso = _now_utc().isoformat()
-    for r in rollup_rows:
-        r["updated_at"] = now_iso
-
-    if rollup_rows:
-        supabase.table(TBL_ROLLUP).upsert(rollup_rows, on_conflict="customer_uid").execute()
+def next_owner(current_owner: Optional[str]) -> Optional[str]:
+    if not OWNER_IDS:
+        return None
+    if not current_owner:
+        return OWNER_IDS[0]
+    try:
+        idx = OWNER_IDS.index(current_owner)
+    except ValueError:
+        return OWNER_IDS[0]
+    nxt = idx + 1
+    if nxt >= len(OWNER_IDS):
+        return None
+    return OWNER_IDS[nxt]
 
 
-async def _process_one_page(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Process exactly one page for the current cursor_date.
-    If the page is empty -> advance to next day and reset page=1.
-    """
-    cursor_date_raw = state.get("cursor_date")
-    cursor_page = int(state.get("cursor_page") or 1)
+async def process_one_page(state: Dict[str, Any]) -> Dict[str, Any]:
+    owner = state.get("cursor_owner") or (OWNER_IDS[0] if OWNER_IDS else None)
+    if not owner:
+        raise RuntimeError("OWNER_IDS is empty. Set OWNER_IDS env var or edit OWNER_IDS in main.py")
 
-    if not cursor_date_raw:
-        # If no cursor_date yet, initialize from run_start_date
-        run_start = state.get("run_start_date")
-        if not run_start:
-            raise RuntimeError("No cursor_date and no run_start_date. Use /start?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD")
-        cursor_date = _parse_ymd(run_start)
-        cursor_page = 1
-    else:
-        cursor_date = _parse_ymd(cursor_date_raw)
+    start = int(state.get("cursor_start") or 0)
+    length = PAGE_SIZE
 
-    run_end_raw = state.get("run_end_date")
-    if not run_end_raw:
-        raise RuntimeError("No run_end_date set. Use /start?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD")
-    run_end = _parse_ymd(run_end_raw)
-
-    if cursor_date > run_end:
-        # Done
-        await _supabase_update_state({
-            "status": "idle",
-            "last_message": f"Completed: cursor_date {cursor_date} past run_end_date {run_end}",
-            "last_heartbeat_at": _now_utc().isoformat(),
-        })
-        return {"done": True, "message": "Completed"}
-
-    # Fetch and upsert
-    payload = await _http_get_salesorders(cursor_date, cursor_page)
-    sales_orders = payload.get("sales_orders") or []
-
-    # Heartbeat before heavy work
-    await _supabase_update_state({
-        "last_heartbeat_at": _now_utc().isoformat(),
-        "last_message": f"Fetched day={cursor_date} page={cursor_page} orders={len(sales_orders)}",
+    await sb_update_state({
+        "status": "running",
+        "last_heartbeat_at": now_utc_iso(),
+        "last_message": f"Fetching owner={owner} start={start} length={length}",
         "last_error": None,
-        "status": state.get("status") or "running",
     })
 
-    if not sales_orders:
-        # Advance to next day
-        next_day = cursor_date + timedelta(days=1)
-        await _supabase_update_state({
-            "cursor_date": next_day.isoformat(),
-            "cursor_page": 1,
-            "pages_processed": int(state.get("pages_processed") or 0) + 1,
-            "last_heartbeat_at": _now_utc().isoformat(),
-            "last_message": f"No orders on day={cursor_date} page={cursor_page}; advancing to {next_day}",
+    payload = await http_fetch_contacts(owner, start, length)
+    data = payload.get("data") or []
+
+    # Convert + upsert
+    contacts = [row_to_contact(owner, r) for r in data]
+    await upsert_contacts(contacts)
+
+    pages_processed = int(state.get("pages_processed") or 0) + 1
+    rows_processed = int(state.get("orders_processed") or 0) + len(contacts)
+
+    # Decide next cursor
+    if len(data) < length:
+        # Owner finished -> move to next owner, reset start
+        nxt = next_owner(owner)
+        if nxt is None:
+            await sb_update_state({
+                "status": "idle",
+                "cursor_owner": owner,
+                "cursor_start": start,  # last start
+                "pages_processed": pages_processed,
+                "orders_processed": rows_processed,
+                "last_heartbeat_at": now_utc_iso(),
+                "last_message": f"Completed all owners. Last owner={owner} returned {len(data)} (<{length}).",
+            })
+            return {"done": True, "message": "Completed all owners"}
+
+        await sb_update_state({
+            "cursor_owner": nxt,
+            "cursor_start": 0,
+            "pages_processed": pages_processed,
+            "orders_processed": rows_processed,
+            "last_heartbeat_at": now_utc_iso(),
+            "last_message": f"Owner {owner} finished (returned {len(data)}). Moving to owner={nxt} start=0.",
         })
-        return {"done": False, "advanced_day": True, "day": str(cursor_date), "page": cursor_page}
+        return {"done": False, "owner_finished": True, "owner": owner, "next_owner": nxt, "returned": len(data)}
 
-    rows = [_order_to_row(o) for o in sales_orders]
-    await _upsert_orders(rows)
-
-    affected_customer_uids = [r.get("customer_uid") for r in rows if r.get("customer_uid")]
-    await _refresh_rollups_for_customer_uids(affected_customer_uids)
-
-    # Update state for next page
-    await _supabase_update_state({
-        "cursor_date": cursor_date.isoformat(),
-        "cursor_page": cursor_page + 1,
-        "pages_processed": int(state.get("pages_processed") or 0) + 1,
-        "orders_processed": int(state.get("orders_processed") or 0) + len(rows),
-        "last_heartbeat_at": _now_utc().isoformat(),
-        "last_message": f"Upserted {len(rows)} orders for day={cursor_date} page={cursor_page}",
+    # More pages for this owner
+    new_start = start + len(data)  # safest (works even if server returns <length sometimes)
+    await sb_update_state({
+        "cursor_owner": owner,
+        "cursor_start": new_start,
+        "pages_processed": pages_processed,
+        "orders_processed": rows_processed,
+        "last_heartbeat_at": now_utc_iso(),
+        "last_message": f"Upserted {len(data)} rows for owner={owner}. Next start={new_start}.",
     })
+    return {"done": False, "owner": owner, "start": start, "returned": len(data), "next_start": new_start}
 
-    return {"done": False, "advanced_day": False, "day": str(cursor_date), "page": cursor_page, "orders": len(rows)}
 
-
-async def _worker_run_until_done() -> None:
-    """
-    Background loop: keeps processing pages until:
-      - status becomes stopping/idle/error
-      - cursor_date passes run_end_date
-    Checkpointing is in wms_job_state so it can resume after restart.
-    """
+async def worker_loop() -> None:
     while True:
-        state = await _supabase_get_state()
+        state = await sb_get_state()
         status = (state.get("status") or "idle").lower()
 
         if status == "stopping":
-            await _supabase_update_state({
+            await sb_update_state({
                 "status": "idle",
                 "last_message": "Stopped by user",
-                "last_heartbeat_at": _now_utc().isoformat(),
+                "last_heartbeat_at": now_utc_iso(),
             })
             return
 
         if status != "running":
-            # Only run when explicitly set to running
             return
 
         try:
-            result = await _process_one_page(state)
+            result = await process_one_page(state)
             if result.get("done"):
                 return
         except Exception as e:
-            await _supabase_update_state({
+            await sb_update_state({
                 "status": "error",
                 "last_error": str(e),
                 "last_message": "Worker stopped due to error",
-                "last_heartbeat_at": _now_utc().isoformat(),
+                "last_heartbeat_at": now_utc_iso(),
             })
             return
 
         await asyncio.sleep(SLEEP_BETWEEN_PAGES_SEC)
 
 
-async def _ensure_worker_running() -> None:
+async def ensure_worker_running() -> None:
     global _worker_task
     async with _worker_lock:
         if _worker_task and not _worker_task.done():
             return
-        _worker_task = asyncio.create_task(_worker_run_until_done())
+        _worker_task = asyncio.create_task(worker_loop())
 
 
 # =============================================================================
@@ -487,140 +470,119 @@ async def health():
 
 @app.get("/", response_class=HTMLResponse)
 async def status_page(request: Request):
-    state = await _supabase_get_state()
+    state = await sb_get_state()
 
-    # Worker task status
     worker_running = _worker_task is not None and not _worker_task.done()
 
-    # Heartbeat staleness
     hb = state.get("last_heartbeat_at")
     heartbeat_stale = False
-    if hb:
+    if hb and state.get("status") == "running":
         try:
             hb_dt = datetime.fromisoformat(hb.replace("Z", "+00:00"))
-            heartbeat_stale = (_now_utc() - hb_dt) > timedelta(minutes=5) and (state.get("status") == "running")
+            heartbeat_stale = (datetime.now(timezone.utc) - hb_dt).total_seconds() > 300
         except Exception:
             heartbeat_stale = False
-
-    # Defaults for form
-    today = date.today()
-    default_start = (today - timedelta(days=1)).isoformat()
-    default_end = today.isoformat()
 
     html = jinja_env.get_template("status.html").render(
         request=request,
         state=state,
         worker_running=worker_running,
         heartbeat_stale=heartbeat_stale,
-        default_start=default_start,
-        default_end=default_end,
+        owners=OWNER_IDS,
+        page_size=PAGE_SIZE,
     )
     return HTMLResponse(html)
 
 
 @app.get("/start")
-async def start(start_date: str, end_date: str):
-    """
-    Start (or resume) importing over a date range inclusive.
-    Uses checkpoint fields cursor_date/cursor_page.
-    """
-    s = _parse_ymd(start_date)
-    e = _parse_ymd(end_date)
-    if e < s:
-        return JSONResponse({"ok": False, "error": "end_date must be >= start_date"}, status_code=400)
+async def start():
+    state = await sb_get_state()
 
-    # Initialize cursor if missing or out of range
-    state = await _supabase_get_state()
-    cursor_date_raw = state.get("cursor_date")
-    cursor_page = int(state.get("cursor_page") or 1)
+    # If no cursor_owner set, initialize to first owner
+    cursor_owner = state.get("cursor_owner") or (OWNER_IDS[0] if OWNER_IDS else None)
+    if not cursor_owner:
+        return JSONResponse({"ok": False, "error": "OWNER_IDS is empty"}, status_code=400)
 
-    if not cursor_date_raw:
-        cursor_date = s
-        cursor_page = 1
-    else:
-        cursor_date = _parse_ymd(cursor_date_raw)
-        # If existing cursor is outside the new range, reset to start
-        if cursor_date < s or cursor_date > e:
-            cursor_date = s
-            cursor_page = 1
+    # Keep existing cursor_start if present, else 0
+    cursor_start = int(state.get("cursor_start") or 0)
 
-    await _supabase_update_state({
+    await sb_update_state({
         "status": "running",
-        "run_start_date": s.isoformat(),
-        "run_end_date": e.isoformat(),
-        "cursor_date": cursor_date.isoformat(),
-        "cursor_page": cursor_page,
+        "cursor_owner": cursor_owner,
+        "cursor_start": cursor_start,
         "last_error": None,
-        "last_message": f"Started: {s} → {e} at cursor {cursor_date} page {cursor_page}",
-        "last_heartbeat_at": _now_utc().isoformat(),
+        "last_message": f"Started/resumed at owner={cursor_owner} start={cursor_start}",
+        "last_heartbeat_at": now_utc_iso(),
     })
 
-    await _ensure_worker_running()
-    return {"ok": True, "message": "Worker started", "run_start_date": start_date, "run_end_date": end_date}
+    await ensure_worker_running()
+    return {"ok": True, "message": "Worker started", "cursor_owner": cursor_owner, "cursor_start": cursor_start}
 
 
 @app.get("/stop")
 async def stop():
-    await _supabase_update_state({
+    await sb_update_state({
         "status": "stopping",
         "last_message": "Stop requested",
-        "last_heartbeat_at": _now_utc().isoformat(),
+        "last_heartbeat_at": now_utc_iso(),
     })
     return {"ok": True, "message": "Stop requested"}
 
 
 @app.get("/reset")
 async def reset():
-    """
-    Reset cursor_date/cursor_page back to run_start_date (keeps the range).
-    """
-    state = await _supabase_get_state()
-    run_start = state.get("run_start_date")
-    run_end = state.get("run_end_date")
-    if not run_start or not run_end:
-        return JSONResponse({"ok": False, "error": "No run_start_date/run_end_date set. Use /start first."}, status_code=400)
+    if not OWNER_IDS:
+        return JSONResponse({"ok": False, "error": "OWNER_IDS is empty"}, status_code=400)
 
-    await _supabase_update_state({
-        "cursor_date": run_start,
-        "cursor_page": 1,
+    await sb_update_state({
+        "status": "idle",
+        "cursor_owner": OWNER_IDS[0],
+        "cursor_start": 0,
         "pages_processed": 0,
         "orders_processed": 0,
         "last_error": None,
-        "last_message": f"Reset cursor to {run_start} page 1",
-        "last_heartbeat_at": _now_utc().isoformat(),
+        "last_message": f"Reset cursor to owner={OWNER_IDS[0]} start=0",
+        "last_heartbeat_at": now_utc_iso(),
     })
-    return {"ok": True, "message": "Reset complete", "cursor_date": run_start, "cursor_page": 1}
+    return {"ok": True, "message": "Reset complete", "cursor_owner": OWNER_IDS[0], "cursor_start": 0}
 
 
 @app.get("/tick")
 async def tick():
     """
-    Process exactly one page (useful for manual step-through or external cron hitting /tick).
+    Process exactly one page (no background loop needed).
     """
-    state = await _supabase_get_state()
-    try:
-        # Temporarily treat as running for tick
-        if (state.get("status") or "").lower() != "running":
-            await _supabase_update_state({"status": "running", "last_message": "Tick invoked; setting status=running"})
-            state = await _supabase_get_state()
+    state = await sb_get_state()
 
-        result = await _process_one_page(state)
+    # Ensure initialized
+    if not state.get("cursor_owner"):
+        if not OWNER_IDS:
+            return JSONResponse({"ok": False, "error": "OWNER_IDS is empty"}, status_code=400)
+        await sb_update_state({"cursor_owner": OWNER_IDS[0], "cursor_start": 0})
+
+    # Temporarily set running so UI is consistent
+    if (state.get("status") or "").lower() != "running":
+        await sb_update_state({"status": "running", "last_message": "Tick invoked; setting status=running"})
+
+    state = await sb_get_state()
+
+    try:
+        result = await process_one_page(state)
         return {"ok": True, "result": result}
     except Exception as e:
-        await _supabase_update_state({
+        await sb_update_state({
             "status": "error",
             "last_error": str(e),
             "last_message": "Tick failed",
-            "last_heartbeat_at": _now_utc().isoformat(),
+            "last_heartbeat_at": now_utc_iso(),
         })
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 @app.on_event("startup")
 async def on_startup():
-    # Auto-resume if configured and DB status says running
     if not START_ON_STARTUP:
         return
-    state = await _supabase_get_state()
+    state = await sb_get_state()
     if (state.get("status") or "").lower() == "running":
-        await _ensure_worker_running()
+        await ensure_worker_running()
