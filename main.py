@@ -17,12 +17,12 @@ from supabase import create_client
 # CONFIG (edit these at the top)
 # =============================================================================
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "PASTE_SUPABASE_URL_HERE")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "PASTE_SUPABASE_SERVICE_ROLE_KEY_HERE")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://yqxfrwxqytmjjkyezdvi.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlxeGZyd3hxeXRtampreWV6ZHZpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Mjc1OTE3NzksImV4cCI6MjA0MzE2Nzc3OX0.AaAZKtvXvAyfLCpLOOIaRKO8KntH70p9J0KJo3jBDpU")
 
 # WMS / Fulcrum API
 FULCRUM_HOST = os.getenv("FULCRUM_HOST", "rootsfulfillment.shoppingcartfulfillment.com")
-FULCRUM_AUTH = os.getenv("FULCRUM_AUTH", "PASTE_AUTH_HEADER_VALUE_HERE")  # e.g. "Bearer xxx" or "xxxxx" as required
+FULCRUM_AUTH = os.getenv("FULCRUM_AUTH", "Basic am1vbm5pZzpBbmNob3JlZDEyMzgh")  # e.g. "Bearer xxx" or "xxxxx" as required
 
 # Import behavior
 START_ON_STARTUP = os.getenv("START_ON_STARTUP", "true").lower() == "true"
