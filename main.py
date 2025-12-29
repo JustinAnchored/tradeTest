@@ -33,7 +33,7 @@ FULCRUM_PATH = os.getenv("FULCRUM_PATH", "/fulcrum/dstContainer.php")
 FULCRUM_COOKIE = os.getenv("FULCRUM_COOKIE", "ace.settings=%7B%22navbar-fixed%22%3A1%2C%22sidebar-fixed%22%3A1%2C%22sidebar-collapsed%22%3A-1%7D; dstIntegratedLabelType=1; dstPrintOrderChecked=1; dstCloudComputer=641378; dstLabelPrinterFormat_74392833=PDF; dstLabelPrinterFormat_74451316=ZPL; ajs_anonymous_id=%225c037d72-7ca4-48f8-98ac-01245b4f9414%22; dstLabelPrinter=74392833; dstLabelPrinterFormat=PDF; dstIntegratedLabelPrinter=74392833; dstPackingListPrinter=74392833; dstPickTicketPrinter=74392833; dstToken=8a22ce4a68e3a9369132cfd89fa4a3ff")
 
 # Owners to iterate (dstOwnerList)
-OWNER_IDS = ["33423","27","98580","31","566813","59921","641632","524862","1004425","295644","309210","581507","609057","150705","296540","296517","296546","288234","488296","513406","447199","214228","437199","106234","279259","28","296426","132850","638486","518270","181418","223858","51","32","29","260886","489011","46495","33524","10","181324","56","265694","258737","363440","617057","84524","460759","91040","513422","451243","9","55","517974","225472","260976","623746","66652","50471","167781"]
+OWNER_IDS = ["32","29","260886","489011","46495","33524","10","181324","56","265694","258737","363440","617057","84524","460759","91040","513422","451243","9","55","517974","225472","260976","623746","66652","50471","167781"]
 
 
 # Pagination
